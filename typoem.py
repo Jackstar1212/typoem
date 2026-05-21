@@ -525,10 +525,16 @@ class Font:
 
         Examples
         --------
-        >>> cn.bold()("加粗文字")
+        >>> cn.bold()("加粗文字")       # ✓ 两层括号：先 .bold() 得到 Font，再传文字
         >>> cn.bold(2.0)("更粗的文字")
         >>> cn.bold().italic()("粗斜体")
         """
+        if isinstance(strength, str):
+            raise TypeError(
+                f"bold() 的参数是粗细强度（float），不是文字。\n"
+                f"  ✗ cn.bold({strength!r})  ← 错误，把文字当成了强度参数\n"
+                f"  ✓ cn.bold()({strength!r})  ← 正确：先 .bold() 拿到字体，再传文字"
+            )
         return self._clone(_style=self._style.copy(weight=strength))
 
     def italic(self, slant: float = 0.25) -> "Font":
@@ -871,7 +877,7 @@ class TextLine:
         orientation: str = "horizontal",
         rotation: int = 0,
         pad: int = 0,
-        sep: int = 1,
+        sep: int = 0,
     ):
         """
         渲染到 Matplotlib Axes（使用 AnnotationBbox）。
@@ -904,13 +910,25 @@ class TextLine:
             fp = FontProperties(fname=span.font._path, size=eff_size)
             if span.style.italic:
                 fp.set_style("italic")
-            if span.style.weight > 0:
-                fp.set_weight(min(900, int(400 + span.style.weight * 300)))
             textprops = dict(fontproperties=fp)
             total_rot = rotation + span.style.rotation
             if total_rot:
                 textprops["rotation"] = total_rot
-            return TextArea(span.text, textprops=textprops)
+            ta = TextArea(span.text, textprops=textprops)
+            # 伪字重：用 patheffects.Stroke 描边笔画，对任何无粗体字形的字体均有效
+            # fp.set_weight() 只能选字体变体，宋体/楷体/仿宋等无粗体字形时无效。
+            # linewidth 按字号比例缩放（约为字号的 1/14），避免在高 DPI 下晕边。
+            if span.style.weight > 0:
+                try:
+                    import matplotlib.patheffects as _pe
+                    lw = (eff_size / 14.0) * span.style.weight
+                    ta._text.set_path_effects([
+                        _pe.Stroke(linewidth=lw),
+                        _pe.Normal(),
+                    ])
+                except Exception:
+                    pass
+            return ta
 
         # ── 竖排：VPacker ────────────────────────────────────────
         if orientation == "vertical":
@@ -1193,7 +1211,7 @@ class BoundAxes:
         loc: str = "center",
         xy: Optional[Tuple[float, float]] = None,
         pad: int = 6,
-        sep: int = 1,
+        sep: int = 0,
         orientation: str = "horizontal",
         **kwargs,
     ):
@@ -1227,7 +1245,7 @@ class BoundAxes:
         label,
         xy: Optional[Tuple[float, float]] = None,
         pad: int = 6,
-        sep: int = 1,
+        sep: int = 0,
         **kwargs,
     ):
         """支持 TextLine/Span；普通字符串透传给原生 set_xlabel。"""
@@ -1247,7 +1265,7 @@ class BoundAxes:
         xy: Optional[Tuple[float, float]] = None,
         rotation: int = 90,
         pad: int = 6,
-        sep: int = 1,
+        sep: int = 0,
         **kwargs,
     ):
         """支持 TextLine/Span；普通字符串透传给原生 set_ylabel。"""
@@ -1269,7 +1287,7 @@ class BoundAxes:
         transform=None,
         rotation: int = 0,
         pad: int = 0,
-        sep: int = 1,
+        sep: int = 0,
         orientation: str = "horizontal",
         **kwargs,
     ):
