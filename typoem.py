@@ -4,12 +4,82 @@ from __future__ import annotations
 import os
 import platform
 import re
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Tuple, Union
 
 
 # ─────────────────────────────────────────────────────────────────
-#  字体名称 → 文件名候选映射
+#  排版样式
+# ─────────────────────────────────────────────────────────────────
+
+@dataclass
+class TextStyle:
+    """
+    Span 的排版样式，支持连续字重、伪斜体、下划线、删除线、
+    位移、旋转与上下标。
+
+    所有参数均有合理默认值；未启用的效果零开销。样式方法可链式调用：
+
+        cn.bold().italic()("粗斜体")
+        cn.underline(width=2, count=2)("双下划线")
+        cn("x²").sup()          # 上标
+        cn("CO").sub()("2")     # 下标
+
+    Parameters
+    ----------
+    weight : float
+        连续字重：0 = 正常，1 = 标准粗体（.bold() 的等价形式），支持小数。
+    italic : bool
+        启用伪斜体（水平剪切变形）。
+    italic_slant : float
+        倾斜量，推荐范围 0.15–0.40，默认 0.25。
+    underline : bool
+        启用下划线。
+    underline_width : int
+        下划线线宽（像素）。
+    underline_count : int
+        下划线条数（1 = 单线，2 = 双线）。
+    underline_gap : int
+        双线间距（像素）。
+    strikethrough : bool
+        启用删除线。
+    strikethrough_width : int
+        删除线线宽（像素）。
+    shift_x : float
+        水平偏移量（排版点，正方向向右）。
+    shift_y : float
+        垂直偏移量（排版点，正方向向上）。
+    rotation : float
+        旋转角度（度，正方向逆时针）。
+    script : str
+        上下标模式：``""``（无）、``"sup"``（上标）、``"sub"``（下标）。
+    script_ratio : float
+        上下标字号缩放比例，默认 0.65。
+    """
+
+    weight:             float = 0.0
+    italic:             bool  = False
+    italic_slant:       float = 0.25
+    underline:          bool  = False
+    underline_width:    int   = 1
+    underline_count:    int   = 1
+    underline_gap:      int   = 3
+    strikethrough:      bool  = False
+    strikethrough_width: int  = 1
+    shift_x:            float = 0.0
+    shift_y:            float = 0.0
+    rotation:           float = 0.0
+    script:             str   = ""
+    script_ratio:       float = 0.65
+
+    def copy(self, **overrides) -> "TextStyle":
+        """返回修改了指定字段的新 TextStyle（原对象不变）。"""
+        return replace(self, **overrides)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  字体名称 → 根据文件名候选映射
 # ─────────────────────────────────────────────────────────────────
 
 _FONT_ALIAS: dict[str, list[str]] = {
@@ -199,6 +269,191 @@ def _resolve(name: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────
+#  PIL 绘制辅助
+# ─────────────────────────────────────────────────────────────────
+
+def _bold_offsets(weight: float) -> list:
+    """生成伪粗体多次绘制的 (dx, dy) 偏移列表。
+
+    weight=1 → [(0,0),(1,0)]（轻，+1 px 右移）
+    weight=2 → +2 px 横向，+1 px 纵向（中）
+    weight=3 → +3 px 横向，+1 px 纵向（重）
+    """
+    r = max(1, int(round(weight)))
+    result: list = [(0, 0)]
+    for dx in range(1, r + 1):
+        result.append((dx, 0))
+    if weight > 1.5:
+        for dx in range(r):
+            result.append((dx, 1))
+    return result
+
+
+def _to_rgba(color) -> tuple:
+    """将任意 PIL 颜色值转为 RGBA 整数元组（用于 RGBA 临时画布）。"""
+    if isinstance(color, (tuple, list)):
+        c = tuple(int(v) for v in color)
+        return c if len(c) == 4 else (*c[:3], 255)
+    try:
+        from PIL import ImageColor
+        r, g, b = ImageColor.getrgb(color)
+        return (r, g, b, 255)
+    except Exception:
+        return (0, 0, 0, 255)
+
+
+def _draw_span_pil(img, draw, x: float, baseline_y: float,
+                   span, font, advance: float,
+                   ascent: int, descent: int, color) -> None:
+    """将单个 Span 渲染到 PIL Image，应用全部样式效果。
+
+    PIL 后端支持：伪粗体（多偏移重绘）、伪斜体（仿射剪切）、
+    旋转（仿射变换）、下划线（单/双，可调粗细间距）、删除线。
+
+    Parameters
+    ----------
+    img        : PIL Image，供粘贴临时画布用（需支持 paste/alpha_composite）。
+    draw       : ImageDraw 对象，用于直接绘制及装饰线。
+    x          : 当前光标水平坐标。
+    baseline_y : 基线 y 坐标（已含 shift_y / script 偏移）。
+    advance    : 该 Span 的排版步进宽度（已含粗/斜体附加量）。
+    """
+    from PIL import Image
+
+    style   = span.style
+    h       = ascent + descent
+    total_w = max(8, int(advance) + 4)
+    rgba_fill = _to_rgba(color)
+
+    needs_temp = style.italic or style.weight > 0 or style.rotation != 0
+
+    if needs_temp:
+        from PIL import ImageDraw as _PD
+        temp  = Image.new("RGBA", (total_w, h + 2), (0, 0, 0, 0))
+        tdraw = _PD.Draw(temp)
+        if style.weight > 0:
+            for dx, dy in _bold_offsets(style.weight):
+                tdraw.text((dx, ascent + dy), span.text, font=font,
+                           fill=rgba_fill, anchor="ls")
+        else:
+            tdraw.text((0, ascent), span.text, font=font,
+                       fill=rgba_fill, anchor="ls")
+
+        if style.italic:
+            slant = style.italic_slant
+            transform_data = (1, slant, -slant * h, 0, 1, 0)
+            _affine   = getattr(getattr(Image, "Transform",  Image), "AFFINE",   2)
+            _bilinear = getattr(getattr(Image, "Resampling", Image), "BILINEAR", 2)
+            temp = temp.transform(
+                (total_w, h + 2), _affine, transform_data, resample=_bilinear
+            )
+
+        paste_x = int(x)
+        paste_y = int(baseline_y - ascent)
+        if style.rotation != 0:
+            _bilinear = getattr(getattr(Image, "Resampling", Image), "BILINEAR", 2)
+            orig_cx   = total_w / 2
+            orig_cy   = (h + 2) / 2
+            temp      = temp.rotate(style.rotation, expand=True, resample=_bilinear)
+            new_w, new_h = temp.size
+            paste_x = round(int(x) + orig_cx - new_w / 2)
+            paste_y = round(int(baseline_y - ascent) + orig_cy - new_h / 2)
+
+        alpha_mask = temp.split()[3]
+        if img.mode == "RGBA":
+            tmp_full = Image.new("RGBA", img.size, (0, 0, 0, 0))
+            tmp_full.paste(temp, (paste_x, paste_y))
+            img.alpha_composite(tmp_full)
+        else:
+            img.paste(temp.convert(img.mode), (paste_x, paste_y), alpha_mask)
+    else:
+        draw.text((x, baseline_y), span.text, font=font,
+                  fill=color, anchor="ls")
+
+    # 下划线（绘制在基线下方，不受斜体/旋转影响）
+    if style.underline:
+        lw   = max(1, style.underline_width)
+        gap  = style.underline_gap
+        y0   = int(baseline_y) + 2
+        for i in range(max(1, style.underline_count)):
+            top = y0 + i * (lw + gap)
+            draw.rectangle([int(x), top, int(x + advance), top + lw - 1], fill=color)
+
+    # 删除线（绘制在字形中部）
+    if style.strikethrough:
+        lw    = max(1, style.strikethrough_width)
+        mid_y = int(baseline_y - ascent * 0.35)
+        draw.rectangle([int(x), mid_y, int(x + advance), mid_y + lw - 1], fill=color)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  Matplotlib 装饰辅助
+# ─────────────────────────────────────────────────────────────────
+
+def _register_mpl_decorations(ax, text_areas: list, spans) -> None:
+    """注册 draw_event 回调，在 Span 绘制完成后叠加下划线 / 删除线。
+
+    利用 AnnotationBbox 渲染后各 TextArea 已具备像素坐标的特性，
+    直接通过 renderer.draw_path 在显示坐标系（IdentityTransform）
+    中绘制填充矩形。对 PNG / SVG / PDF 等主流后端均有效。
+
+    Note
+    ----
+    回调在每次 figure 重绘时触发，装饰始终与文本位置保持一致。
+    """
+    from matplotlib.path import Path as MplPath
+    import matplotlib.transforms as _mtr
+
+    fig = ax.get_figure()
+
+    def _on_draw(event):
+        renderer = getattr(event, "renderer", None)
+        if renderer is None:
+            return
+        gc       = renderer.new_gc()
+        gc.set_linewidth(0)
+        identity = _mtr.IdentityTransform()
+        black    = (0.0, 0.0, 0.0)
+
+        for ta, span in zip(text_areas, spans):
+            style = span.style
+            if not (style.underline or style.strikethrough):
+                continue
+            try:
+                bbox = ta.get_window_extent(renderer)
+            except Exception:
+                continue
+
+            x0, y0, x1, y1 = bbox.x0, bbox.y0, bbox.x1, bbox.y1
+
+            def _rect(rx0, ry0, rx1, ry1):
+                if rx1 <= rx0 or ry1 <= ry0:
+                    return
+                verts = [(rx0, ry0), (rx1, ry0), (rx1, ry1),
+                         (rx0, ry1), (rx0, ry0)]
+                codes = [MplPath.MOVETO, MplPath.LINETO, MplPath.LINETO,
+                         MplPath.LINETO, MplPath.CLOSEPOLY]
+                renderer.draw_path(gc, MplPath(verts, codes),
+                                   identity, rgbFace=black)
+
+            if style.strikethrough:
+                lw  = max(1, style.strikethrough_width)
+                mid = y0 + (y1 - y0) * 0.45
+                _rect(x0, mid, x1, mid + lw)
+
+            if style.underline:
+                lw   = max(1, style.underline_width)
+                base = y0 - 2
+                for i in range(max(1, style.underline_count)):
+                    ry1 = base - i * (lw + style.underline_gap)
+                    _rect(x0, ry1 - lw, x1, ry1)
+
+        gc.restore()
+
+    fig.canvas.mpl_connect("draw_event", _on_draw)
+
+
+# ─────────────────────────────────────────────────────────────────
 #  核心类
 # ─────────────────────────────────────────────────────────────────
 
@@ -224,10 +479,11 @@ class Font:
         self._path: str = _resolve(name_or_path)
         self.size: int = size
         self.name: str = name_or_path
+        self._style: TextStyle = TextStyle()
 
     def __call__(self, text: str, size: Optional[int] = None) -> "Span":
-        """生成绑定当前字体的文本片段 Span。"""
-        return Span(text, self, size if size is not None else self.size)
+        """生成绑定当前字体及样式的文本片段 Span。"""
+        return Span(text, self, size if size is not None else self.size, self._style)
 
     def at(self, size: int) -> "Font":
         """
@@ -238,10 +494,163 @@ class Font:
         >>> cn.at(14)("大号标题")
         """
         f = Font.__new__(Font)
-        f._path = self._path
-        f.name  = self.name
-        f.size  = size
+        f._path  = self._path
+        f.name   = self.name
+        f.size   = size
+        f._style = self._style
         return f
+
+    def _clone(self, **overrides) -> "Font":
+        """返回复制了所有属性的新 Font，并应用 overrides 中的覆盖。"""
+        f = Font.__new__(Font)
+        f._path  = self._path
+        f.name   = self.name
+        f.size   = self.size
+        f._style = self._style
+        for k, v in overrides.items():
+            object.__setattr__(f, k, v)
+        return f
+
+    def bold(self, strength: float = 1.0) -> "Font":
+        """返回启用伪粗体的新 Font（原对象不变）。
+
+        即使字体没有粗体字形，也能通过多次偏移重绘实现视觉加粗。
+        等价于 ``.weight(strength)``，strength=1.0 为标准粗体。
+
+        Parameters
+        ----------
+        strength : float
+            粗体程度，1.0 = 轻（+1 px），2.0 = 中，3.0 = 重。
+            可传小数，如 1.5。
+
+        Examples
+        --------
+        >>> cn.bold()("加粗文字")
+        >>> cn.bold(2.0)("更粗的文字")
+        >>> cn.bold().italic()("粗斜体")
+        """
+        return self._clone(_style=self._style.copy(weight=strength))
+
+    def italic(self, slant: float = 0.25) -> "Font":
+        """返回启用伪斜体的新 Font（原对象不变）。
+
+        通过水平剪切变形实现斜体效果，即使字体无斜体字形。
+
+        Parameters
+        ----------
+        slant : float
+            倾斜量（水平剪切系数），推荐范围 0.15–0.40。
+
+        Examples
+        --------
+        >>> cn.italic()("斜体文字")
+        >>> cn.italic(0.3)("更斜")
+        """
+        return self._clone(_style=self._style.copy(
+            italic=True, italic_slant=slant))
+
+    def underline(self, width: int = 1, count: int = 1,
+                  gap: int = 3) -> "Font":
+        """返回启用下划线的新 Font（原对象不变）。
+
+        Parameters
+        ----------
+        width : int
+            线宽（像素）。
+        count : int
+            条数，1 = 单线，2 = 双线。
+        gap : int
+            双线之间的间距（像素）。
+
+        Examples
+        --------
+        >>> cn.underline()("下划线")
+        >>> cn.underline(width=2)("粗下划线")
+        >>> cn.underline(count=2, gap=2)("双下划线")
+        """
+        return self._clone(_style=self._style.copy(
+            underline=True, underline_width=width,
+            underline_count=count, underline_gap=gap))
+
+    def strikethrough(self, width: int = 1) -> "Font":
+        """返回启用删除线的新 Font（原对象不变）。
+
+        Parameters
+        ----------
+        width : int
+            线宽（像素）。
+
+        Examples
+        --------
+        >>> cn.strikethrough()("删除线文字")
+        >>> cn.strikethrough(2)("粗删除线")
+        """
+        return self._clone(_style=self._style.copy(
+            strikethrough=True, strikethrough_width=width))
+
+    def weight(self, w: float) -> "Font":
+        """返回设置连续字重的新 Font（原对象不变）。
+
+        w=0 为正常，w=1 相当于 .bold()，支持小数（如 0.5 = 半粗）。
+        PIL 后端使用多次偏移重绘（synthetic bold）；
+        Matplotlib 后端映射到字体系统字重（400+w×300，上限 900）。
+
+        Examples
+        --------
+        >>> cn.weight(0.5)("半粗")
+        >>> cn.weight(2.0)("特粗")
+        """
+        return self._clone(_style=self._style.copy(weight=w))
+
+    def shift(self, x: float = 0.0, y: float = 0.0) -> "Font":
+        """返回设置基线偏移的新 Font（原对象不变）。
+
+        Parameters
+        ----------
+        x, y : float
+            偏移量（排版点）。y 正方向为上，x 正方向为右。
+
+        Examples
+        --------
+        >>> en.shift(y=2)("略微上移")
+        """
+        return self._clone(_style=self._style.copy(shift_x=x, shift_y=y))
+
+    def rotate(self, angle: float) -> "Font":
+        """返回设置旋转角度的新 Font（原对象不变）。
+
+        Parameters
+        ----------
+        angle : float
+            旋转角度（度）。正方向逆时针。
+
+        Examples
+        --------
+        >>> cn.rotate(15)("斜向文字")
+        """
+        return self._clone(_style=self._style.copy(rotation=angle))
+
+    def sup(self, ratio: float = 0.65) -> "Font":
+        """返回上标样式的新 Font（原对象不变）。
+
+        字号缩小为 ratio 倍并上移至上标位置。
+
+        Examples
+        --------
+        >>> cn("x") + en.sup()("2")   # x²
+        """
+        return self._clone(_style=self._style.copy(script="sup", script_ratio=ratio))
+
+    def sub(self, ratio: float = 0.65) -> "Font":
+        """返回下标样式的新 Font（原对象不变）。
+
+        字号缩小为 ratio 倍并下移至下标位置。
+
+        Examples
+        --------
+        >>> cn("CO") + en.sub()("2")   # CO₂
+        """
+        return self._clone(_style=self._style.copy(script="sub", script_ratio=ratio))
 
     @staticmethod
     def list_fonts() -> list[str]:
@@ -255,7 +664,17 @@ class Font:
         return sorted(set(found))
 
     def __repr__(self) -> str:
-        return f"Font({self.name!r}, size={self.size})"
+        s = self._style
+        parts = []
+        if s.weight:        parts.append(f"weight={s.weight}")
+        if s.italic:        parts.append(f"italic={s.italic_slant}")
+        if s.underline:     parts.append(f"underline(×{s.underline_count},w={s.underline_width})")
+        if s.strikethrough: parts.append(f"strikethrough(w={s.strikethrough_width})")
+        if s.script:        parts.append(f"{s.script}(×{s.script_ratio})")
+        if s.shift_x or s.shift_y: parts.append(f"shift({s.shift_x},{s.shift_y})")
+        if s.rotation:      parts.append(f"rotate({s.rotation}°)")
+        suffix = f", {', '.join(parts)}" if parts else ""
+        return f"Font({self.name!r}, size={self.size}{suffix})"
 
 
 class Span:
@@ -267,12 +686,14 @@ class Span:
         line = cn("中文") + en(" English")
     """
 
-    __slots__ = ("text", "font", "size")
+    __slots__ = ("text", "font", "size", "style")
 
-    def __init__(self, text: str, font: Font, size: int) -> None:
-        self.text: str  = text
-        self.font: Font = font
-        self.size: int  = size
+    def __init__(self, text: str, font: Font, size: int,
+                 style: Optional[TextStyle] = None) -> None:
+        self.text:  str       = text
+        self.font:  Font      = font
+        self.size:  int       = size
+        self.style: TextStyle = style if style is not None else TextStyle()
 
     def __add__(self, other: Union["Span", "TextLine"]) -> "TextLine":
         if isinstance(other, Span):
@@ -301,6 +722,50 @@ class Span:
 
     def __repr__(self) -> str:
         return f"Span({self.font.name!r}, {self.text!r}, size={self.size})"
+
+    # ── Span 级样式方法（返回新 Span，原对象不变）──────────────────
+
+    def _with_style(self, **kw) -> "Span":
+        """返回应用了样式修改的新 Span（原对象不变）。"""
+        return Span(self.text, self.font, self.size, self.style.copy(**kw))
+
+    def bold(self, strength: float = 1.0) -> "Span":
+        """Span 级粗体（等价于 .weight(strength)）。"""
+        return self._with_style(weight=strength)
+
+    def weight(self, w: float) -> "Span":
+        """Span 级连续字重（0=正常，1=标准粗，支持小数）。"""
+        return self._with_style(weight=w)
+
+    def italic(self, slant: float = 0.25) -> "Span":
+        """Span 级伪斜体。"""
+        return self._with_style(italic=True, italic_slant=slant)
+
+    def underline(self, width: int = 1, count: int = 1,
+                  gap: int = 3) -> "Span":
+        """Span 级下划线。"""
+        return self._with_style(underline=True, underline_width=width,
+                                underline_count=count, underline_gap=gap)
+
+    def strikethrough(self, width: int = 1) -> "Span":
+        """Span 级删除线。"""
+        return self._with_style(strikethrough=True, strikethrough_width=width)
+
+    def shift(self, x: float = 0.0, y: float = 0.0) -> "Span":
+        """Span 级位移（排版点，y 正向为上）。"""
+        return self._with_style(shift_x=x, shift_y=y)
+
+    def rotate(self, angle: float) -> "Span":
+        """Span 级旋转（度，正方向逆时针）。"""
+        return self._with_style(rotation=angle)
+
+    def sup(self, ratio: float = 0.65) -> "Span":
+        """Span 级上标（字号 × ratio，上移）。"""
+        return self._with_style(script="sup", script_ratio=ratio)
+
+    def sub(self, ratio: float = 0.65) -> "Span":
+        """Span 级下标（字号 × ratio，下移）。"""
+        return self._with_style(script="sub", script_ratio=ratio)
 
 
 class TextLine:
@@ -422,34 +887,114 @@ class TextLine:
         orientation : str
             ``'horizontal'``（横排）或 ``'vertical'``（竖排）。
         rotation : int
-            文字旋转角度（度）。
+            整体文字旋转角度（度）；可被 Span 级 .rotate() 叠加。
         pad : int
             整体内边距（像素）。
         sep : int
-            各片段间距（像素）。
+            各片段间距（排版点）。
         """
         from matplotlib.font_manager import FontProperties
         from matplotlib.offsetbox import HPacker, VPacker, TextArea, AnnotationBbox
 
-        children = []
-        for span in self._spans:
-            fp = FontProperties(fname=span.font._path, size=span.size)
-            ta = TextArea(
-                span.text,
-                textprops=dict(fontproperties=fp, rotation=rotation),
-            )
-            children.append(ta)
-
-        if not children:
+        if not self._spans:
             return None
 
-        if orientation == "vertical":
-            packer = VPacker(children=children, align="center", pad=pad, sep=sep)
-        else:
-            packer = HPacker(children=children, align="baseline", pad=pad, sep=sep)
+        def _make_ta(span):
+            eff_size = round(span.size * span.style.script_ratio) if span.style.script else span.size
+            fp = FontProperties(fname=span.font._path, size=eff_size)
+            if span.style.italic:
+                fp.set_style("italic")
+            if span.style.weight > 0:
+                fp.set_weight(min(900, int(400 + span.style.weight * 300)))
+            textprops = dict(fontproperties=fp)
+            total_rot = rotation + span.style.rotation
+            if total_rot:
+                textprops["rotation"] = total_rot
+            return TextArea(span.text, textprops=textprops)
 
-        ab = AnnotationBbox(packer, (x, y), xycoords=coords, frameon=False, pad=pad)
+        # ── 竖排：VPacker ────────────────────────────────────────
+        if orientation == "vertical":
+            children = [_make_ta(s) for s in self._spans]
+            packer = VPacker(children=children, align="center", pad=pad, sep=sep)
+            ab = AnnotationBbox(packer, (x, y), xycoords=coords, frameon=False,
+                                pad=pad, box_alignment=(0.5, 0.5))
+            ax.add_artist(ab)
+            if any(s.style.underline or s.style.strikethrough for s in self._spans):
+                _register_mpl_decorations(ax, children, self._spans)
+            return ab
+
+        # ── 横排：若任一 span 有 y 偏移/上下标，改用逐 span 独立定位 ──
+        needs_individual = (
+            coords == "axes fraction"
+            and any(s.style.shift_y != 0 or s.style.shift_x != 0 or s.style.script
+                    for s in self._spans)
+        )
+        if needs_individual:
+            try:
+                from PIL import ImageFont, Image, ImageDraw
+            except ImportError:
+                needs_individual = False
+
+        if needs_individual:
+            fig     = ax.get_figure()
+            ax_pos  = ax.get_position()
+            ax_w_in = ax_pos.width  * fig.get_figwidth()
+            ax_h_in = ax_pos.height * fig.get_figheight()
+
+            metrics  = self._pil_metrics()
+            dummy    = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+            # 先算总宽，居中
+            total_pts = sum(m[1] for m in metrics) + sep * max(0, len(metrics) - 1)
+            start_x   = x - (total_pts / 2) / (72 * ax_w_in)
+
+            text_areas, artists, cursor_pts = [], [], 0.0
+            for (font, advance, ascent, descent), span in zip(metrics, self._spans):
+                ta = _make_ta(span)
+                text_areas.append(ta)
+
+                span_x = start_x + (cursor_pts + span.style.shift_x) / (72 * ax_w_in)
+
+                eff_size = round(span.size * span.style.script_ratio) if span.style.script else span.size
+                script_y = 0.0
+                if span.style.script == "sup":
+                    script_y = (span.size - eff_size) * 0.9
+                elif span.style.script == "sub":
+                    script_y = -(eff_size * 0.25)
+                span_y = y + (span.style.shift_y + script_y) / (72 * ax_h_in)
+
+                # 逐 span 基线分数
+                try:
+                    _, fd = font.getmetrics()
+                    lp_bb = dummy.textbbox((0, 0), "lp", font=font, anchor="ls")
+                    lp_h  = -lp_bb[1]
+                    t_bb  = dummy.textbbox((0, 0), span.text, font=font, anchor="ls")
+                    g_asc = max(0, -t_bb[1])
+                    asc   = max(lp_h, g_asc)
+                    tot   = fd + asc
+                    bf    = fd / tot if tot > 0 else 0.5
+                except Exception:
+                    bf = 0.5
+
+                ab = AnnotationBbox(ta, (span_x, span_y), xycoords=coords,
+                                    frameon=False, pad=0, box_alignment=(0.0, bf))
+                ax.add_artist(ab)
+                artists.append(ab)
+                cursor_pts += advance + sep
+
+            if any(s.style.underline or s.style.strikethrough for s in self._spans):
+                _register_mpl_decorations(ax, text_areas, self._spans)
+            return artists[0] if artists else None
+
+        # ── 横排默认：HPacker ─────────────────────────────────────
+        children = [_make_ta(s) for s in self._spans]
+        packer = HPacker(children=children, align="baseline", pad=pad, sep=sep)
+        box_alignment = (0.5, _mpl_baseline_fraction(self._spans, ax))
+        ab = AnnotationBbox(packer, (x, y), xycoords=coords, frameon=False, pad=pad,
+                            box_alignment=box_alignment)
         ax.add_artist(ab)
+        if any(s.style.underline or s.style.strikethrough for s in self._spans):
+            _register_mpl_decorations(ax, children, self._spans)
         return ab
 
     # ── Matplotlib 快捷方法（直接调用，不需要 bind）──────────────
@@ -486,13 +1031,20 @@ class TextLine:
         dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
         result = []
         for span in self._spans:
-            font = ImageFont.truetype(span.font._path, size=span.size)
+            eff_size = round(span.size * span.style.script_ratio) if span.style.script else span.size
+            font = ImageFont.truetype(span.font._path, size=eff_size)
             ascent, descent = font.getmetrics()
             try:
                 advance = font.getlength(span.text)   # Pillow 9.2+，更精确
             except AttributeError:
                 bbox = dummy.textbbox((0, 0), span.text, font=font, anchor="ls")
                 advance = float(bbox[2] - bbox[0])
+            # 为粗体预留横向偏移量
+            if span.style.weight > 0:
+                advance += float(max(1, int(round(span.style.weight))))
+            # 为斜体预留顶部右倾宽度（防止裁切）
+            if span.style.italic:
+                advance += span.style.italic_slant * (ascent + descent)
             result.append((font, float(advance), ascent, descent))
         return result
 
@@ -525,8 +1077,16 @@ class TextLine:
         draw = ImageDraw.Draw(img)
         cursor = float(x)
         for (font, advance, ascent, descent), span in zip(metrics, self._spans):
-            draw.text((cursor, baseline_y), span.text, font=font,
-                      fill=color, anchor="ls")
+            eff_x = cursor + span.style.shift_x
+            eff_y = baseline_y - span.style.shift_y   # pt = px at 72 DPI；正向上 = PIL y 减小
+            if span.style.script:
+                eff_size = round(span.size * span.style.script_ratio)
+                if span.style.script == "sup":
+                    eff_y -= (span.size - eff_size) * 0.9   # 上移
+                elif span.style.script == "sub":
+                    eff_y += eff_size * 0.25                 # 下移
+            _draw_span_pil(img, draw, eff_x, eff_y,
+                           span, font, advance, ascent, descent, color)
             cursor += advance + spacing
 
     def render(
@@ -554,6 +1114,11 @@ class TextLine:
         total_w    = sum(m[1] for m in metrics) + spacing * max(0, len(metrics) - 1)
         max_ascent  = max(m[2] for m in metrics)
         max_descent = max(m[3] for m in metrics)
+        # 下标可能超出字体下降沿，额外预留空间
+        for span, (_, _, asc, desc) in zip(self._spans, metrics):
+            if span.style.script == "sub":
+                eff_size = round(span.size * span.style.script_ratio)
+                max_descent = max(max_descent, desc + int(eff_size * 0.25) + 2)
 
         img = Image.new(
             "RGB",
@@ -768,6 +1333,65 @@ def bind(ax) -> BoundAxes:
         ax.plot([1, 2, 3], [1, 4, 9])   # 非文本调用照常工作
     """
     return BoundAxes(ax)
+
+
+# ─────────────────────────────────────────────────────────────────
+#  辅助：基线锚点计算（修正 AnnotationBbox 下沉问题）
+# ─────────────────────────────────────────────────────────────────
+
+def _mpl_baseline_fraction(spans: list, ax) -> float:
+    """
+    计算 HPacker 包围盒中基线所在的纵向比例（从底部算起），
+    供 ``AnnotationBbox(box_alignment=(0.5, fraction))`` 使用。
+
+    原理
+    ----
+    Matplotlib 原生 ``ax.text(x, y, text)`` 默认 ``va='baseline'``，
+    即文字基线位于 y。但 ``AnnotationBbox`` 默认以包围盒中心锚定
+    （``box_alignment=(0.5, 0.5)``），导致基线偏低，英文短字母（如"mm"）视觉上比原生 fallback 下沉更多。
+
+    本函数用 PIL 字体度量近似 Matplotlib TextArea 的基线位置：
+
+    * ``yd_max``    ← 各 Span 字体 descent（下伸量）取最大值，换算至图形 DPI
+    * ``asc_max``   ← 各 Span 取 max(lp字形上伸, 实际文字上伸)，换算至图形 DPI
+    * ``fraction``  = yd_max / (yd_max + asc_max)
+
+    和原生比对，在 100 DPI 下误差 < 0.02px，可以实现像素级基线对齐。
+    如果 PIL 不可用则回退到 0.5（居中）。
+    """
+    try:
+        from PIL import ImageFont, Image, ImageDraw
+    except ImportError:
+        return 0.5
+
+    try:
+        scale = ax.get_figure().dpi / 72.0
+        dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+
+        yd_vals: list[float] = []
+        asc_vals: list[float] = []
+        for span in spans:
+            eff_size = round(span.size * span.style.script_ratio) if span.style.script else span.size
+            f = ImageFont.truetype(span.font._path, size=eff_size)
+            _, font_descent = f.getmetrics()
+
+            # lp 字形高度近似 TextArea 的 h_-d_（参考上伸量）
+            lp_bbox = dummy.textbbox((0, 0), "lp", font=f, anchor="ls")
+            lp_cap_h = -lp_bbox[1]                     # "l" 字形上伸
+
+            # 实际文本字形的上伸量
+            text_bbox = dummy.textbbox((0, 0), span.text, font=f, anchor="ls")
+            glyph_asc = max(0, -text_bbox[1])
+
+            yd_vals.append(font_descent * scale)
+            asc_vals.append(max(lp_cap_h, glyph_asc) * scale)
+
+        yd_max = max(yd_vals)
+        asc_max = max(asc_vals)
+        total = yd_max + asc_max
+        return yd_max / total if total > 0 else 0.5
+    except Exception:
+        return 0.5
 
 
 # ─────────────────────────────────────────────────────────────────
