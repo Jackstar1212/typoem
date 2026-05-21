@@ -16,7 +16,11 @@ Matplotlib 的文本系统在中英混排场景下经常遇到：
 - 标题/标签混排代码繁琐
 - 难以实现高出版质量的图表排版
 
-typoem 用一个极轻量的对象模型解决这些问题。
+Typoem 并未取代 Matplotlib 的字体回退系统。
+它提供了一个轻量级的对象模型，用于实现明确的混合字体排版。
+
+Typoem does not replace Matplotlib's font fallback system.
+It provides a lightweight object model for explicit mixed-font typography.
 
 ## 设计理念
 
