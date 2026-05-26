@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 import os
 import platform
@@ -1747,9 +1747,10 @@ class AutoFont:
 
 def _print_help() -> None:
     print(
-        "typoem — 通用多字体混排引擎\n"
         "\n"
-        "基本用法：\n"
+        "> Typoem | A lightweight mixed-font typesetting engine for Python.\n"
+        "\n"
+        "> 基本用法：\n"
         "  from typoem import Font, bind\n"
         "\n"
         "  cn   = Font('宋体',   size=9)\n"
@@ -1765,7 +1766,7 @@ def _print_help() -> None:
         "  line.render().save('out.png')\n"
         "  line.preview()\n"
         "\n"
-        "  # 方式二：bind 套进原生函数\n"
+        "  # 方式二：bind 嵌套原生函数\n"
         "  ax = bind(ax)\n"
         "  ax.set_title(cn('实验结果') + en(' Results'))\n"
         "  ax.set_xlabel(cn('X轴') + en(' X-axis'))\n"
@@ -1788,9 +1789,23 @@ def _print_help() -> None:
 def main() -> None:
     import argparse
     import sys
+
+    class _PrintVersion(argparse.Action):
+        def __init__(self, option_strings, dest=argparse.SUPPRESS,
+                     default=argparse.SUPPRESS, help=None):
+            super().__init__(option_strings=option_strings, dest=dest,
+                             default=default, nargs=0, help=help)
+        def __call__(self, parser, namespace, values, option_string=None):
+            print(
+                "\n"
+                f"> Typoem | A lightweight mixed-font typesetting engine for Python.\n"
+                f"> Version: {__version__}"
+                "\n"
+            )
+            parser.exit()
+
     parser = argparse.ArgumentParser(prog="typoem", add_help=False)
-    parser.add_argument("-V", "--version", action="version",
-                        version=f"typoem {__version__}")
+    parser.add_argument("-V", "--version", action=_PrintVersion)
     parser.add_argument("-h", "--help", action="store_true")
     args = parser.parse_args()
     if args.help or len(sys.argv) == 1:
