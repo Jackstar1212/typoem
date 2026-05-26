@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+__version__ = "0.3.0"
+
 import os
 import platform
 import re
+import warnings
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Tuple, Union
@@ -28,8 +31,8 @@ class TextStyle:
 
     Parameters
     ----------
-    weight : float
-        连续字重：0 = 正常，1 = 标准粗体（.bold() 的等价形式），支持小数。
+    weight : int
+        CSS 风格字重：0~1000，默认 400（正常），700 约等价标准粗体。
     italic : bool
         启用伪斜体（水平剪切变形）。
     italic_slant : float
@@ -58,7 +61,7 @@ class TextStyle:
         上下标字号缩放比例，默认 0.65。
     """
 
-    weight:             float = 0.0
+    weight:             int   = 400
     italic:             bool  = False
     italic_slant:       float = 0.25
     underline:          bool  = False
@@ -279,6 +282,9 @@ def _bold_offsets(weight: float) -> list:
     weight=2 → +2 px 横向，+1 px 纵向（中）
     weight=3 → +3 px 横向，+1 px 纵向（重）
     """
+    if weight < 0.9:
+        return [(0, 0)]
+
     r = max(1, int(round(weight)))
     result: list = [(0, 0)]
     for dx in range(1, r + 1):
@@ -287,6 +293,158 @@ def _bold_offsets(weight: float) -> list:
         for dx in range(r):
             result.append((dx, 1))
     return result
+
+
+def _weight_to_synthetic_strength(weight: int) -> float:
+    """将 0~1000 字重映射为伪粗体强度（用于 PIL / Matplotlib 统一绘制）。
+
+    规则：
+    - <= 400：不做伪粗体
+    - 700：约等于标准粗体（强度 1.0）
+    - 1000：强度 2.0
+    """
+    if weight <= 400:
+        return 0.0
+    return (weight - 400) / 300.0
+
+
+def _coerce_css_weight(w: Union[int, float], *, stacklevel: int = 2) -> int:
+    """校验并归一化 weight 参数为 0~1000 整数。"""
+    if isinstance(w, bool) or not isinstance(w, (int, float)):
+        raise TypeError("weight() 需要传入 0~1000 的数值，例如 300/400/700。")
+
+    wi = int(round(float(w)))
+    if wi < 0 or wi > 1000:
+        raise ValueError(f"weight() 仅支持 0~1000，当前为 {w!r}。")
+
+    return wi
+
+
+def _try_apply_variable_weight(font, weight: int) -> bool:
+    """对可变字体尝试设置 wght 轴。返回 True 表示已成功应用。"""
+    try:
+        axes = font.get_variation_axes()
+    except Exception:
+        return False
+
+    wght_axis = None
+    for a in axes:
+        tag = a.get("tag", b"")
+        if isinstance(tag, bytes):
+            tag = tag.decode("ascii", errors="replace")
+        if tag.strip() == "wght":
+            wght_axis = a
+            break
+
+    if wght_axis is None:
+        return False
+
+    min_w = float(wght_axis.get("minimum", 100))
+    max_w = float(wght_axis.get("maximum", 900))
+    clamped = max(min_w, min(max_w, float(weight)))
+
+    if int(clamped) != weight:
+        warnings.warn(
+            f"字体 wght 轴范围为 {int(min_w)}~{int(max_w)}，"
+            f"weight={weight} 已钳制到 {int(clamped)}。",
+            UserWarning, stacklevel=5,
+        )
+
+    values = []
+    for a in axes:
+        tag = a.get("tag", b"")
+        if isinstance(tag, bytes):
+            tag = tag.decode("ascii", errors="replace")
+        if tag.strip() == "wght":
+            values.append(clamped)
+        else:
+            default = float(a.get(
+                "default",
+                (float(a.get("minimum", 0)) + float(a.get("maximum", 1000))) / 2,
+            ))
+            values.append(default)
+
+    try:
+        font.set_variation_by_axes(values)
+        return True
+    except Exception:
+        return False
+
+
+def _load_pil_font_with_weight(path: str, size: int, weight: int):
+    """加载 PIL 字体并应用字重，返回 (FreeTypeFont, synth_strength: float)。
+
+    - 可变字体且有 wght 轴：轴值已设置，synth_strength=0.0
+    - 静态字体 weight>400：synth_strength 为正（用于伪粗体）
+    - 静态字体 weight<400：发出警告，synth_strength=0.0（保持默认字重）
+    """
+    from PIL import ImageFont
+    font = ImageFont.truetype(path, size=size)
+
+    if weight == 400:
+        return font, 0.0
+
+    if _try_apply_variable_weight(font, weight):
+        return font, 0.0
+
+    if weight < 400:
+        warnings.warn(
+            f"字体不支持可变字重（wght 轴），weight={weight} 无法变细；"
+            "已保持默认自重 400。",
+            UserWarning, stacklevel=4,
+        )
+        return font, 0.0
+
+    return font, _weight_to_synthetic_strength(weight)
+
+
+def _render_span_for_mpl(span, dpi_scale: float):
+    """将 Span 以 RGBA 像素数组渲染，用于 Matplotlib OffsetImage 嵌入。
+
+    对以下场景激活：
+    - 斜体（italic）：通过 PIL 仿射剪切实现真实倾斜
+    - 可变字体非默认字重（weight != 400 且字体有 wght 轴）
+    其余情况返回 None，由调用方回退到 TextArea+patheffects 路径。
+
+    Returns
+    -------
+    (ndarray H×W×4, ascent_px, descent_px) 或 None（不适用时）
+    """
+    is_variable_weight = span.style.weight != 400
+    if not (is_variable_weight or span.style.italic):
+        return None
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import numpy as np
+    except ImportError:
+        return None
+
+    eff_size_pt = round(span.size * span.style.script_ratio) if span.style.script else span.size
+    render_size = max(1, round(eff_size_pt * dpi_scale))
+
+    font = ImageFont.truetype(span.font._path, render_size)
+    if is_variable_weight and not _try_apply_variable_weight(font, span.style.weight):
+        if not span.style.italic:
+            return None  # 静态字体，无法变细，且非斜体，回退到 TextArea（含警告）
+
+    ascent, descent = font.getmetrics()
+    try:
+        raw_advance = int(font.getlength(span.text))
+    except AttributeError:
+        dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+        bb = dummy.textbbox((0, 0), span.text, font=font, anchor="ls")
+        raw_advance = bb[2] - bb[0]
+
+    if span.style.italic:
+        raw_advance += int(span.style.italic_slant * (ascent + descent))
+
+    total_w = max(4, raw_advance + 4)
+    total_h = ascent + descent + 2
+    img = Image.new("RGBA", (total_w, total_h), (0, 0, 0, 0))
+    _draw_span_pil(img, ImageDraw.Draw(img), 0, ascent,
+                   span, font, float(raw_advance), ascent, descent,
+                   (0, 0, 0, 255), 0.0)
+    return np.array(img), ascent, descent
 
 
 def _to_rgba(color) -> tuple:
@@ -304,7 +462,8 @@ def _to_rgba(color) -> tuple:
 
 def _draw_span_pil(img, draw, x: float, baseline_y: float,
                    span, font, advance: float,
-                   ascent: int, descent: int, color) -> None:
+                   ascent: int, descent: int, color,
+                   synth_strength: float = 0.0) -> None:
     """将单个 Span 渲染到 PIL Image，应用全部样式效果。
 
     PIL 后端支持：伪粗体（多偏移重绘）、伪斜体（仿射剪切）、
@@ -325,14 +484,14 @@ def _draw_span_pil(img, draw, x: float, baseline_y: float,
     total_w = max(8, int(advance) + 4)
     rgba_fill = _to_rgba(color)
 
-    needs_temp = style.italic or style.weight > 0 or style.rotation != 0
+    needs_temp = style.italic or synth_strength >= 0.9 or style.rotation != 0
 
     if needs_temp:
         from PIL import ImageDraw as _PD
         temp  = Image.new("RGBA", (total_w, h + 2), (0, 0, 0, 0))
         tdraw = _PD.Draw(temp)
-        if style.weight > 0:
-            for dx, dy in _bold_offsets(style.weight):
+        if synth_strength >= 0.9:
+            for dx, dy in _bold_offsets(synth_strength):
                 tdraw.text((dx, ascent + dy), span.text, font=font,
                            fill=rgba_fill, anchor="ls")
         else:
@@ -340,21 +499,28 @@ def _draw_span_pil(img, draw, x: float, baseline_y: float,
                        fill=rgba_fill, anchor="ls")
 
         if style.italic:
-            slant = style.italic_slant
-            transform_data = (1, slant, -slant * h, 0, 1, 0)
-            _affine   = getattr(getattr(Image, "Transform",  Image), "AFFINE",   2)
-            _bilinear = getattr(getattr(Image, "Resampling", Image), "BILINEAR", 2)
-            temp = temp.transform(
-                (total_w, h + 2), _affine, transform_data, resample=_bilinear
+            slant    = style.italic_slant
+            _affine  = getattr(getattr(Image, "Transform",  Image), "AFFINE",  2)
+            _bicubic = getattr(getattr(Image, "Resampling", Image), "BICUBIC", 3)
+            _lanczos = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
+            _nearest = getattr(getattr(Image, "Resampling", Image), "NEAREST", 0)
+            tw, th = temp.size
+            # 2× 超采样再缩回：消除仿射插值模糊（transform 只支持 BICUBIC 及以下）
+            big   = temp.resize((tw * 2, th * 2), _nearest)
+            big   = big.transform(
+                (tw * 2, th * 2), _affine,
+                (1, slant, -slant * th * 2, 0, 1, 0),
+                resample=_bicubic,
             )
+            temp  = big.resize((tw, th), _lanczos)
 
         paste_x = int(x)
         paste_y = int(baseline_y - ascent)
         if style.rotation != 0:
-            _bilinear = getattr(getattr(Image, "Resampling", Image), "BILINEAR", 2)
+            _lanczos = getattr(getattr(Image, "Resampling", Image), "LANCZOS", 1)
             orig_cx   = total_w / 2
             orig_cy   = (h + 2) / 2
-            temp      = temp.rotate(style.rotation, expand=True, resample=_bilinear)
+            temp      = temp.rotate(style.rotation, expand=True, resample=_lanczos)
             new_w, new_h = temp.size
             paste_x = round(int(x) + orig_cx - new_w / 2)
             paste_y = round(int(baseline_y - ascent) + orig_cy - new_h / 2)
@@ -511,31 +677,22 @@ class Font:
             object.__setattr__(f, k, v)
         return f
 
-    def bold(self, strength: float = 1.0) -> "Font":
+    def bold(self) -> "Font":
         """返回启用伪粗体的新 Font（原对象不变）。
 
         即使字体没有粗体字形，也能通过多次偏移重绘实现视觉加粗。
-        等价于 ``.weight(strength)``，strength=1.0 为标准粗体。
-
-        Parameters
-        ----------
-        strength : float
-            粗体程度，1.0 = 轻（+1 px），2.0 = 中，3.0 = 重。
-            可传小数，如 1.5。
+        等价于 ``.weight(700)``。
 
         Examples
         --------
         >>> cn.bold()("加粗文字")       # ✓ 两层括号：先 .bold() 得到 Font，再传文字
-        >>> cn.bold(2.0)("更粗的文字")
         >>> cn.bold().italic()("粗斜体")
         """
-        if isinstance(strength, str):
-            raise TypeError(
-                f"bold() 的参数是粗细强度（float），不是文字。\n"
-                f"  ✗ cn.bold({strength!r})  ← 错误，把文字当成了强度参数\n"
-                f"  ✓ cn.bold()({strength!r})  ← 正确：先 .bold() 拿到字体，再传文字"
-            )
-        return self._clone(_style=self._style.copy(weight=strength))
+        return self._clone(_style=self._style.copy(weight=700))
+
+    def b(self) -> "Font":
+        """.bold() 的简写。"""
+        return self.bold()
 
     def italic(self, slant: float = 0.25) -> "Font":
         """返回启用伪斜体的新 Font（原对象不变）。
@@ -554,6 +711,10 @@ class Font:
         """
         return self._clone(_style=self._style.copy(
             italic=True, italic_slant=slant))
+
+    def i(self, slant: float = 0.25) -> "Font":
+        """.italic() 的简写。"""
+        return self.italic(slant)
 
     def underline(self, width: int = 1, count: int = 1,
                   gap: int = 3) -> "Font":
@@ -578,6 +739,10 @@ class Font:
             underline=True, underline_width=width,
             underline_count=count, underline_gap=gap))
 
+    def u(self, width: int = 1, count: int = 1, gap: int = 3) -> "Font":
+        """.underline() 的简写。"""
+        return self.underline(width=width, count=count, gap=gap)
+
     def strikethrough(self, width: int = 1) -> "Font":
         """返回启用删除线的新 Font（原对象不变）。
 
@@ -594,19 +759,31 @@ class Font:
         return self._clone(_style=self._style.copy(
             strikethrough=True, strikethrough_width=width))
 
-    def weight(self, w: float) -> "Font":
-        """返回设置连续字重的新 Font（原对象不变）。
+    def st(self, width: int = 1) -> "Font":
+        """.strikethrough() 的简写。"""
+        return self.strikethrough(width=width)
 
-        w=0 为正常，w=1 相当于 .bold()，支持小数（如 0.5 = 半粗）。
-        PIL 后端使用多次偏移重绘（synthetic bold）；
-        Matplotlib 后端映射到字体系统字重（400+w×300，上限 900）。
+    def weight(self, w: float = 400) -> "Font":
+        """返回设置字重的新 Font（原对象不变）。
+
+        参数采用 CSS 风格范围 ``0~1000``：
+        - ``400`` = 默认自重（normal）
+        - ``700`` = 标准粗体（约等于 ``.bold()``）
+
+        当前版本暂不支持真正"变细"，当 ``w < 400`` 时会回落到 400 并提示。
 
         Examples
         --------
-        >>> cn.weight(0.5)("半粗")
-        >>> cn.weight(2.0)("特粗")
+        >>> cn.weight()("默认自重")
+        >>> cn.weight(500)("中等偏粗")
+        >>> cn.weight(700)("标准粗")
         """
-        return self._clone(_style=self._style.copy(weight=w))
+        css_w = _coerce_css_weight(w, stacklevel=2)
+        return self._clone(_style=self._style.copy(weight=css_w))
+
+    def w(self, w: float = 400) -> "Font":
+        """.weight() 的简写。"""
+        return self.weight(w)
 
     def shift(self, x: float = 0.0, y: float = 0.0) -> "Font":
         """返回设置基线偏移的新 Font（原对象不变）。
@@ -622,6 +799,18 @@ class Font:
         """
         return self._clone(_style=self._style.copy(shift_x=x, shift_y=y))
 
+    def offset(self, x: float = 0.0, y: float = 0.0) -> "Font":
+        """.shift() 的语义别名。"""
+        return self.shift(x=x, y=y)
+
+    def sh(self, x: float = 0.0, y: float = 0.0) -> "Font":
+        """.shift() 的简写。"""
+        return self.shift(x=x, y=y)
+
+    def off(self, x: float = 0.0, y: float = 0.0) -> "Font":
+        """.offset() 的简写。"""
+        return self.offset(x=x, y=y)
+
     def rotate(self, angle: float) -> "Font":
         """返回设置旋转角度的新 Font（原对象不变）。
 
@@ -635,6 +824,10 @@ class Font:
         >>> cn.rotate(15)("斜向文字")
         """
         return self._clone(_style=self._style.copy(rotation=angle))
+
+    def r(self, angle: float) -> "Font":
+        """.rotate() 的简写。"""
+        return self.rotate(angle)
 
     def sup(self, ratio: float = 0.65) -> "Font":
         """返回上标样式的新 Font（原对象不变）。
@@ -672,7 +865,7 @@ class Font:
     def __repr__(self) -> str:
         s = self._style
         parts = []
-        if s.weight:        parts.append(f"weight={s.weight}")
+        if s.weight != 400: parts.append(f"weight={s.weight}")
         if s.italic:        parts.append(f"italic={s.italic_slant}")
         if s.underline:     parts.append(f"underline(×{s.underline_count},w={s.underline_width})")
         if s.strikethrough: parts.append(f"strikethrough(w={s.strikethrough_width})")
@@ -735,17 +928,30 @@ class Span:
         """返回应用了样式修改的新 Span（原对象不变）。"""
         return Span(self.text, self.font, self.size, self.style.copy(**kw))
 
-    def bold(self, strength: float = 1.0) -> "Span":
-        """Span 级粗体（等价于 .weight(strength)）。"""
-        return self._with_style(weight=strength)
+    def bold(self) -> "Span":
+        """Span 级粗体（等价于 .weight(700)）。"""
+        return self._with_style(weight=700)
 
-    def weight(self, w: float) -> "Span":
-        """Span 级连续字重（0=正常，1=标准粗，支持小数）。"""
-        return self._with_style(weight=w)
+    def b(self) -> "Span":
+        """.bold() 的简写。"""
+        return self.bold()
+
+    def weight(self, w: float = 400) -> "Span":
+        """Span 级字重（0~1000，默认 400，700=标准粗）。"""
+        css_w = _coerce_css_weight(w, stacklevel=2)
+        return self._with_style(weight=css_w)
+
+    def w(self, w: float = 400) -> "Span":
+        """.weight() 的简写。"""
+        return self.weight(w)
 
     def italic(self, slant: float = 0.25) -> "Span":
         """Span 级伪斜体。"""
         return self._with_style(italic=True, italic_slant=slant)
+
+    def i(self, slant: float = 0.25) -> "Span":
+        """.italic() 的简写。"""
+        return self.italic(slant)
 
     def underline(self, width: int = 1, count: int = 1,
                   gap: int = 3) -> "Span":
@@ -753,17 +959,41 @@ class Span:
         return self._with_style(underline=True, underline_width=width,
                                 underline_count=count, underline_gap=gap)
 
+    def u(self, width: int = 1, count: int = 1, gap: int = 3) -> "Span":
+        """.underline() 的简写。"""
+        return self.underline(width=width, count=count, gap=gap)
+
     def strikethrough(self, width: int = 1) -> "Span":
         """Span 级删除线。"""
         return self._with_style(strikethrough=True, strikethrough_width=width)
+
+    def st(self, width: int = 1) -> "Span":
+        """.strikethrough() 的简写。"""
+        return self.strikethrough(width=width)
 
     def shift(self, x: float = 0.0, y: float = 0.0) -> "Span":
         """Span 级位移（排版点，y 正向为上）。"""
         return self._with_style(shift_x=x, shift_y=y)
 
+    def offset(self, x: float = 0.0, y: float = 0.0) -> "Span":
+        """.shift() 的语义别名。"""
+        return self.shift(x=x, y=y)
+
+    def sh(self, x: float = 0.0, y: float = 0.0) -> "Span":
+        """.shift() 的简写。"""
+        return self.shift(x=x, y=y)
+
+    def off(self, x: float = 0.0, y: float = 0.0) -> "Span":
+        """.offset() 的简写。"""
+        return self.offset(x=x, y=y)
+
     def rotate(self, angle: float) -> "Span":
         """Span 级旋转（度，正方向逆时针）。"""
         return self._with_style(rotation=angle)
+
+    def r(self, angle: float) -> "Span":
+        """.rotate() 的简写。"""
+        return self.rotate(angle)
 
     def sup(self, ratio: float = 0.65) -> "Span":
         """Span 级上标（字号 × ratio，上移）。"""
@@ -918,10 +1148,11 @@ class TextLine:
             # 伪字重：用 patheffects.Stroke 描边笔画，对任何无粗体字形的字体均有效
             # fp.set_weight() 只能选字体变体，宋体/楷体/仿宋等无粗体字形时无效。
             # linewidth 按字号比例缩放（约为字号的 1/14），避免在高 DPI 下晕边。
-            if span.style.weight > 0:
+            synth_strength = _weight_to_synthetic_strength(span.style.weight)
+            if synth_strength >= 0.9:
                 try:
                     import matplotlib.patheffects as _pe
-                    lw = (eff_size / 14.0) * span.style.weight
+                    lw = (eff_size / 14.0) * synth_strength
                     ta._text.set_path_effects([
                         _pe.Stroke(linewidth=lw),
                         _pe.Normal(),
@@ -941,15 +1172,17 @@ class TextLine:
                 _register_mpl_decorations(ax, children, self._spans)
             return ab
 
-        # ── 横排：若任一 span 有 y 偏移/上下标，改用逐 span 独立定位 ──
+        # ── 横排：若任一 span 有 y 偏移/上下标/非默认字重，改用逐 span 独立定位 ──
         needs_individual = (
             coords == "axes fraction"
             and any(s.style.shift_y != 0 or s.style.shift_x != 0 or s.style.script
+                    or s.style.weight != 400 or s.style.italic
                     for s in self._spans)
         )
         if needs_individual:
             try:
                 from PIL import ImageFont, Image, ImageDraw
+                import numpy as np
             except ImportError:
                 needs_individual = False
 
@@ -967,10 +1200,11 @@ class TextLine:
             start_x   = x - (total_pts / 2) / (72 * ax_w_in)
 
             text_areas, artists, cursor_pts = [], [], 0.0
-            for (font, advance, ascent, descent), span in zip(metrics, self._spans):
-                ta = _make_ta(span)
-                text_areas.append(ta)
-
+            # 以高固定 DPI 渲染 PIL 图像，避免存图时因 dpi_cor 放大而模糊
+            _PIL_RENDER_DPI = 600
+            dpi_scale = _PIL_RENDER_DPI / 72.0
+            pil_zoom  = fig.dpi / _PIL_RENDER_DPI
+            for (font, advance, ascent, descent, _synth), span in zip(metrics, self._spans):
                 span_x = start_x + (cursor_pts + span.style.shift_x) / (72 * ax_w_in)
 
                 eff_size = round(span.size * span.style.script_ratio) if span.style.script else span.size
@@ -980,6 +1214,24 @@ class TextLine:
                 elif span.style.script == "sub":
                     script_y = -(eff_size * 0.25)
                 span_y = y + (span.style.shift_y + script_y) / (72 * ax_h_in)
+
+                # 变细字重：尝试可变字体 PIL 光栅化嵌入
+                pil_result = _render_span_for_mpl(span, dpi_scale)
+                if pil_result is not None:
+                    from matplotlib.offsetbox import OffsetImage
+                    arr, img_asc, img_desc = pil_result
+                    oi = OffsetImage(arr, zoom=pil_zoom)
+                    bf = img_desc / max(1, img_asc + img_desc)
+                    ab = AnnotationBbox(oi, (span_x, span_y), xycoords=coords,
+                                        frameon=False, pad=0, box_alignment=(0.0, bf))
+                    ax.add_artist(ab)
+                    artists.append(ab)
+                    text_areas.append(oi)
+                    cursor_pts += advance + sep
+                    continue
+
+                ta = _make_ta(span)
+                text_areas.append(ta)
 
                 # 逐 span 基线分数
                 try:
@@ -1041,16 +1293,19 @@ class TextLine:
 
         Returns
         -------
-        list of (ImageFont, advance_px, ascent_px, descent_px)
+        list of (ImageFont, advance_px, ascent_px, descent_px, synth_strength)
             - advance_px：字符串的排版步进宽度（用 getlength，比 bbox 更精确）
             - ascent_px / descent_px：字体的上升沿/下降沿高度
+            - synth_strength：伪粗体强度（0=无需伪粗体，可变字体已处理或不需要）
         """
-        from PIL import ImageFont, Image, ImageDraw
+        from PIL import Image, ImageDraw
         dummy = ImageDraw.Draw(Image.new("RGB", (1, 1)))
         result = []
         for span in self._spans:
-            eff_size = round(span.size * span.style.script_ratio) if span.style.script else span.size
-            font = ImageFont.truetype(span.font._path, size=eff_size)
+            eff_size = max(9, round(span.size * span.style.script_ratio)) if span.style.script else span.size
+            font, synth_strength = _load_pil_font_with_weight(
+                span.font._path, eff_size, span.style.weight
+            )
             ascent, descent = font.getmetrics()
             try:
                 advance = font.getlength(span.text)   # Pillow 9.2+，更精确
@@ -1058,12 +1313,12 @@ class TextLine:
                 bbox = dummy.textbbox((0, 0), span.text, font=font, anchor="ls")
                 advance = float(bbox[2] - bbox[0])
             # 为粗体预留横向偏移量
-            if span.style.weight > 0:
-                advance += float(max(1, int(round(span.style.weight))))
+            if synth_strength >= 0.9:
+                advance += float(max(1, int(round(synth_strength))))
             # 为斜体预留顶部右倾宽度（防止裁切）
             if span.style.italic:
                 advance += span.style.italic_slant * (ascent + descent)
-            result.append((font, float(advance), ascent, descent))
+            result.append((font, float(advance), ascent, descent, synth_strength))
         return result
 
     def draw_pil(
@@ -1094,7 +1349,7 @@ class TextLine:
 
         draw = ImageDraw.Draw(img)
         cursor = float(x)
-        for (font, advance, ascent, descent), span in zip(metrics, self._spans):
+        for (font, advance, ascent, descent, synth_strength), span in zip(metrics, self._spans):
             eff_x = cursor + span.style.shift_x
             eff_y = baseline_y - span.style.shift_y   # pt = px at 72 DPI；正向上 = PIL y 减小
             if span.style.script:
@@ -1104,7 +1359,7 @@ class TextLine:
                 elif span.style.script == "sub":
                     eff_y += eff_size * 0.25                 # 下移
             _draw_span_pil(img, draw, eff_x, eff_y,
-                           span, font, advance, ascent, descent, color)
+                           span, font, advance, ascent, descent, color, synth_strength)
             cursor += advance + spacing
 
     def render(
@@ -1133,10 +1388,10 @@ class TextLine:
         max_ascent  = max(m[2] for m in metrics)
         max_descent = max(m[3] for m in metrics)
         # 下标可能超出字体下降沿，额外预留空间
-        for span, (_, _, asc, desc) in zip(self._spans, metrics):
+        for span, m in zip(self._spans, metrics):
             if span.style.script == "sub":
                 eff_size = round(span.size * span.style.script_ratio)
-                max_descent = max(max_descent, desc + int(eff_size * 0.25) + 2)
+                max_descent = max(max_descent, m[3] + int(eff_size * 0.25) + 2)
 
         img = Image.new(
             "RGB",
@@ -1294,17 +1549,19 @@ class BoundAxes:
         """
         支持 TextLine/Span；普通字符串透传给原生 text。
 
-        坐标系与 matplotlib 原生行为一致：
-        - 默认使用数据坐标（``'data'``）
-        - 传入 ``transform=ax.transAxes`` 则使用轴比例坐标
+        坐标系：
+        - 传入 TextLine/Span 时默认使用轴比例坐标（``'axes fraction'``）
+        - 传入 ``transform=ax.transAxes`` 则显式使用轴比例坐标
         - 传入 ``transform=fig.transFigure`` 则使用图比例坐标
+        - 传入 ``transform=ax.transData`` 则使用数据坐标
+        - 普通字符串默认行为与原生 text 相同（数据坐标）
         """
         ax = object.__getattribute__(self, "_ax")
         if isinstance(s, (TextLine, Span)):
             line = s if isinstance(s, TextLine) else s._as_line()
 
             if transform is None:
-                coords: object = "data"
+                coords: object = "axes fraction"
             elif transform is ax.transAxes:
                 coords = "axes fraction"
             elif transform is ax.get_figure().transFigure:
@@ -1488,7 +1745,7 @@ class AutoFont:
 
 # ─────────────────────────────────────────────────────────────────
 
-if __name__ == "__main__":
+def _print_help() -> None:
     print(
         "typoem — 通用多字体混排引擎\n"
         "\n"
@@ -1526,3 +1783,19 @@ if __name__ == "__main__":
         "  # 查看系统字体\n"
         "  print(Font.list_fonts())\n"
     )
+
+
+def main() -> None:
+    import argparse
+    import sys
+    parser = argparse.ArgumentParser(prog="typoem", add_help=False)
+    parser.add_argument("-V", "--version", action="version",
+                        version=f"typoem {__version__}")
+    parser.add_argument("-h", "--help", action="store_true")
+    args = parser.parse_args()
+    if args.help or len(sys.argv) == 1:
+        _print_help()
+
+
+if __name__ == "__main__":
+    main()
