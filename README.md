@@ -157,22 +157,33 @@ print(Font.list_fonts())   # 列出系统所有可用字体路径
 ```python
 hei = Font("黑体", size=11)
 
-# .bold() — 标准粗体（等价于 .weight(1.0)）
+# .bold() — 简单粗体开关（等价于 .weight(700)）
 hei.bold()("加粗文字")
 
-# .bold(strength) — 控制粗细程度（1.0 轻 → 3.0 重）
-hei.bold(2.0)("更粗的文字")
-hei.bold(0.5)("半粗")
+# .weight(w) — 精细字重（0~1000）
+hei.weight()("默认自重")       # 不填 = 400
+hei.weight(300)("变细")        # 可变字体时真变细，静态字体则警告并保持默认
+hei.weight(500)("中等偏粗")
+hei.weight(700)("标准粗体")
+hei.weight(900)("更粗")
 
-# .weight(w) — 连续字重，0 = 正常，1 = 标准粗，支持任意小数
-hei.weight(1.5)("介于正常和粗之间")
-hei.weight(3.0)("超粗")
+# 也支持简写
+hei.b()("加粗")
+hei.w(300)("变细")
+hei.w(600)("字重 600")
 ```
 
 > **伪字重原理**：对没有粗体字形的字体（宋体、仿宋、楷体等），
 > PIL 后端通过多次偏移重绘（synthetic bold）实现；
-> Matplotlib 后端映射到字体系统字重（weight → 400 + w×300，上限 900）。
+> Matplotlib 后端通过 path effect 叠加笔画实现近似加粗。
 > 无论字体有没有粗体变体，`.weight()` 都能工作。
+>
+> **关于变细（<400）**：两个后端均支持通过**可变字体**（Variable Fonts）真正控制字重——
+> 若字体文件内含 `wght` 轴（如思源黑体、Noto Sans 等 OTF/TTF 可变字体），
+> 任意 `weight(100~1000)` 值均会直接通过轴值渲染；
+> PIL 后端直接设置轴值，Matplotlib 后端将该 span 以 PIL 光栅化后嵌入为图片，
+> 完整融入 `AnnotationBbox` 排版体系。
+> 静态字体：`>400` 走伪粗体，`<400` 发警告并保持默认字重 400。
 
 ---
 
@@ -197,8 +208,8 @@ en  = Font("Times New Roman", size=10)
 
 # 链式调用，顺序任意，效果叠加
 hei.bold().italic()("粗斜黑体")
-hei.bold(2.0).italic(0.3)("重粗大斜角")
-en.italic(0.2).bold(1.5)("先斜再加粗也可以")
+hei.weight(900).italic(0.3)("重粗大斜角")
+en.italic(0.2).weight(700)("先斜再加粗")
 
 # Span 级链式调用（对单个片段临时加样式）
 (cn("普通正文") + en(" result").bold().italic())
@@ -236,7 +247,7 @@ hei.bold().underline(width=2)("加粗下划线")
 cn.italic().strikethrough()("斜体删除")
 
 # 粗体 + 斜体 + 下划线（三叠）
-en.bold(1.5).italic(0.3).underline(count=2)("全装饰")
+en.weight(700).italic(0.3).underline(count=2)("全装饰")
 ```
 
 ---
@@ -305,7 +316,7 @@ line = (
     cn("普通")
     + en(" result").bold()
     + cn(" 显著").italic().underline()
-    + en(" p<0.05").weight(0.5)
+    + en(" p<0.05").weight(500)
 )
 
 # 化学式：Span 级上下标
@@ -350,19 +361,28 @@ f.at(size)("文本")                 # → Span（临时字号）
 Font.list_fonts()                  # → list[str]
 
 # ── 字重与粗体 ────────────────────────────────────────────────────
-f.bold()                           # 标准粗体（strength=1.0）
-f.bold(2.0)                        # 自定义强度（1–3）
-f.weight(0.5)                      # 连续字重（0=正常，1=标准粗）
+f.bold()                           # 标准粗体（等价于 weight(700)）
+f.weight()                         # 默认自重（400）
+f.weight(300)                      # 变细（可变字体）/ 警告（静态字体）
+f.weight(500)                      # 精细字重（0~1000）
+f.weight(700)                      # 标准粗
+f.weight(900)                      # 很粗
+f.b()                              # .bold() 简写
+f.w(300)                           # .weight() 简写（变细）
+f.w(600)                           # .weight() 简写（加粗）
 
 # ── 斜体 ──────────────────────────────────────────────────────────
 f.italic()                         # 伪斜体（slant=0.25）
 f.italic(0.35)                     # 自定义倾斜量
+f.i(0.35)                          # .italic() 简写
 
 # ── 装饰线 ────────────────────────────────────────────────────────
 f.underline()                      # 单下划线
 f.underline(width=2, count=2, gap=4)  # 双线/自定义粗细间距
+f.u(width=2, count=2)              # .underline() 简写
 f.strikethrough()                  # 删除线
 f.strikethrough(width=2)           # 自定义线宽
+f.st(width=2)                      # .strikethrough() 简写
 
 # ── 上下标 ────────────────────────────────────────────────────────
 f.sup()                            # 上标（ratio=0.65）
@@ -372,12 +392,16 @@ f.sup(ratio=0.7)                   # 自定义缩放比例
 # ── 位移与旋转 ────────────────────────────────────────────────────
 f.shift(y=2)                       # 垂直上移 2pt
 f.shift(x=-1, y=1.5)              # 水平+垂直同时偏移
+f.offset(y=2)                      # .shift() 语义别名
+f.sh(y=2)                          # .shift() 简写
+f.off(x=-1, y=1.5)                 # .offset() 简写
 f.rotate(15)                       # 逆时针旋转 15°
+f.r(15)                            # .rotate() 简写
 
 # ── 链式调用（任意顺序、任意组合）─────────────────────────────────
 f.bold().italic()
-f.bold(1.5).italic(0.3).underline()
-f.weight(2.0).shift(y=1)
+f.weight(700).italic(0.3).underline()
+f.weight(900).shift(y=1)
 
 # ── 片段与拼接 ────────────────────────────────────────────────────
 span1 + span2                      # → TextLine
@@ -389,6 +413,8 @@ line  + line                       # → TextLine
 span.bold()   .italic()   .weight(w)
 span.underline(count=2)  .strikethrough()
 span.sup()    .sub()      .shift(y=2)    .rotate(10)
+span.b()      .i(0.3)     .w(600)
+span.u()      .st()       .sh(y=2)       .r(10)
 
 # ── 渲染 ──────────────────────────────────────────────────────────
 line.draw(ax_or_img, x, y, **kwargs)
@@ -406,6 +432,13 @@ ax.text(x, y, line, transform=ax.transAxes)
 auto = AutoFont("宋体", "Arial")
 auto("中英文 Auto Mix")               # → TextLine
 ```
+
+### 0.2.1 变更说明
+
+- **可变字体真实字重（两端、两后端）**：含 `wght` 轴的字体，任意 `weight(100~1000)` 均走真实轴值渲染；PIL 后端直接设置轴，Matplotlib 后端光栅化嵌入，`bind(ax)` 完全透明支持。静态字体 `>400` 走伪粗体，`<400` 警告保持 400。
+- 旧写法（0~3 语义）已移除，请统一迁移到 `0~1000`。
+- 推荐对照：`400=正常`，`500=中等偏粗`，`700=标准粗`，`900=很粗`。
+- `bold()` 固定表示”标准粗体”，需要精细控制请用 `weight()` / `w()`。
 
 ---
 
